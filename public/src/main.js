@@ -1,3 +1,9 @@
+// Game configuration
+const CONFIG = {
+  debug: true,  // Debug mode enabled by default
+  noCollisionTrees: new Set()  // Track trees with disabled collision
+};
+
 // Add CSS to center the game canvas
 const style = document.createElement('style');
 style.textContent = `
@@ -147,44 +153,198 @@ function create() {
   let obstacleGroup = this.physics.add.staticGroup();
   let obstacleCount = 0;
   
+  // Enable debug for physics bodies (visible in game)
+  // Temporarily disable debug to improve performance
+  this.physics.world.createDebugGraphic();
+  this.physics.world.drawDebug = true; // Enable physics debug
+  
   // Check Trees layer for obstacles
   if (layers["Trees"]) {
+    console.log("=== Initializing Tree Collision System ===");
     console.log("Scanning Trees layer...");
+    
+    // Load saved collision data
+    const savedCollision = localStorage.getItem('treeCollision');
+    if (savedCollision) {
+      try {
+        const savedPositions = JSON.parse(savedCollision);
+        console.log('Loaded saved collision data:', savedPositions);
+        savedPositions.forEach(pos => CONFIG.noCollisionTrees.add(pos));
+      } catch (e) {
+        console.error('Error loading collision data:', e);
+        localStorage.removeItem('treeCollision');
+      }
+    }
+
+    // Store tile references for collision toggling
+    CONFIG.tileColliders = new Map();
+
+    // Process each tree tile
     layers["Trees"].forEachTile(tile => {
-      // Only create collision for tiles that have actual tree graphics (non-zero, non-empty tile indices)
-      if (tile && tile.index > 0) { // Changed from !== -1 to > 0 to avoid empty/background tiles
-        // Create VISIBLE collision rectangle for debugging
-        let obstacle = this.add.rectangle(
-          tile.getCenterX(), 
-          tile.getCenterY(), 
-          30, 30, // Slightly smaller than tile
-          0xff0000, 0.3 // Red color, semi-transparent for debugging
-        );
-        this.physics.add.existing(obstacle, true); // true = static body
-        obstacleGroup.add(obstacle);
-        obstacleCount++;
-        console.log(`Added tree obstacle at ${tile.x},${tile.y} - tile index: ${tile.index}`);
+      if (tile && tile.index > 0) {
+        const posKey = `${tile.x},${tile.y}`;
+        const hasCollision = !CONFIG.noCollisionTrees.has(posKey);
+        
+        // Create a collider for this tile - centered on the tree trunk
+        const obstacle = this.add.rectangle(
+          tile.pixelX + 16,  // Center of the tile
+          tile.pixelY + 40,  // Position at the base of the tree
+          20, 24,           // Slightly smaller than tile size
+          hasCollision ? 0xff0000 : 0x00ff00, 
+          0.5  // Increased alpha for better visibility
+        )
+        .setOrigin(0.9, 2)  // Anchor at bottom center (since trees are tall)
+        .setDepth(1000)     // Make sure debug rectangles are on top
+        .setVisible(CONFIG.debug);
+        
+        // Store reference to this collider
+        const colliderData = { 
+          obstacle, 
+          hasCollision,
+          body: null
+        };
+        
+        // Only add physics if collision is enabled
+        if (hasCollision) {
+          // Create an invisible sprite for the physics body at the tree base
+          const physicsSprite = this.add.rectangle(
+            tile.pixelX + 16,  // Center of the tile
+            tile.pixelY + 16,  // Center of the tile
+            28, 28,           // Slightly smaller than tile size for better feel
+            0x0000ff,         // Blue for debugging (invisible in production)
+            CONFIG.debug ? 0.3 : 0  // Only visible in debug mode
+          )
+          .setOrigin(0.5, 0.5)  // Center the origin
+          .setDepth(9999);      // Ensure it's on top
+          
+          // Add physics to the sprite
+          this.physics.add.existing(physicsSprite);
+          physicsSprite.body.setSize(24, 24, true);  // Smaller than tile for better feel
+          physicsSprite.body.setImmovable(true);
+          physicsSprite.body.allowGravity = false;
+          physicsSprite.body.debugShowBody = CONFIG.debug;
+          physicsSprite.body.onCollide = true;  // Enable collision callbacks
+          
+          // Enable physics debug
+          if (CONFIG.debug) {
+            physicsSprite.setVisible(true);
+          }
+          
+          // Store the physics body reference
+          colliderData.body = physicsSprite.body;
+          obstacleGroup.add(physicsSprite);
+          obstacleCount++;
+        }
+        
+        CONFIG.tileColliders.set(posKey, colliderData);
+
+        // Make tree clickable in debug mode
+        this.add.zone(tile.pixelX + 16, tile.pixelY + 20, 32, 40)  // Slightly higher click area
+          .setInteractive()
+          .setOrigin(0.5, 0.5)  // Center the interactive zone
+          .on('pointerdown', () => {
+            if (!CONFIG.debug) return;
+            
+            const tileData = CONFIG.tileColliders.get(posKey);
+            if (!tileData) return;
+            
+            if (tileData.hasCollision) {
+              // Disable collision
+              tileData.obstacle.setFillStyle(0x00ff00, 0.1);
+              
+              // Remove from physics
+              if (tileData.body) {
+                // Find and remove the physics sprite from the group
+                const physicsSprite = obstacleGroup.getChildren().find(
+                  child => child.body === tileData.body
+                );
+                
+                if (physicsSprite) {
+                  obstacleGroup.remove(physicsSprite, true, true);
+                }
+                
+                if (tileData.body.gameObject) {
+                  tileData.body.gameObject.destroy();
+                }
+                
+                tileData.body.destroy();
+                tileData.body = null;
+                obstacleCount--;
+              }
+              
+              CONFIG.noCollisionTrees.add(posKey);
+              tileData.hasCollision = false;
+            } else {
+              // Enable collision
+              tileData.obstacle.setFillStyle(0xff0000, 0.3);
+              
+              // Add back to physics
+              if (!tileData.body) {
+                // Create a new physics body
+                const pos = tileData.obstacle;
+                const physicsSprite = this.add.rectangle(
+                  Math.floor(pos.x / 32) * 32 + 16,  // Snap to tile center X
+                  Math.floor(pos.y / 32) * 32 + 16,  // Snap to tile center Y
+                  32, 32,                           // Full tile size
+                  0x0000ff,                         // Blue for debugging
+                  CONFIG.debug ? 0.3 : 0
+                )
+                .setOrigin(0.5, 0.5);  // Center the origin
+                
+                // Add physics to the sprite
+                this.physics.add.existing(physicsSprite);
+                physicsSprite.body.setSize(32, 32, false);  // Full tile size
+                physicsSprite.body.setOffset(0, 0);         // No offset needed
+                physicsSprite.body.setImmovable(true);
+                physicsSprite.body.allowGravity = false;
+                physicsSprite.body.debugShowBody = CONFIG.debug;
+                
+                // Store the physics body reference
+                tileData.body = physicsSprite.body;
+                obstacleGroup.add(physicsSprite);
+                obstacleCount++;
+              } else {
+                // Re-enable the existing body
+                tileData.body.enable = true;
+                if (tileData.body.gameObject) {
+                  tileData.body.gameObject.setActive(true).setVisible(false);
+                }
+              }
+              
+              CONFIG.noCollisionTrees.delete(posKey);
+              tileData.hasCollision = true;
+            }
+            
+            // Save to localStorage
+            try {
+              const collisionArray = Array.from(CONFIG.noCollisionTrees);
+              console.log('Updated collisions:', collisionArray);
+              localStorage.setItem('treeCollision', JSON.stringify(collisionArray));
+            } catch (e) {
+              console.error('Error saving collision data:', e);
+            }
+          });
       }
     });
+    
+    console.log(`Added collision for ${obstacleCount} trees`);
   }
   
   // Check Fences layer for obstacles
   if (layers["Fences"]) {
     console.log("Scanning Fences layer...");
     layers["Fences"].forEachTile(tile => {
-      // Only create collision for tiles that have actual fence graphics
-      if (tile && tile.index > 0) { // Changed from !== -1 to > 0 to avoid empty/background tiles
-        // Create VISIBLE collision rectangle for debugging
+      if (tile && tile.index > 0) {
+        // Create a simple physics body for the fence
         let obstacle = this.add.rectangle(
-          tile.getCenterX(), 
-          tile.getCenterY(), 
-          30, 30, // Slightly smaller than tile
-          0x00ff00, 0.3 // Green color, semi-transparent for debugging
+          tile.pixelX + 16, // Center of the tile
+          tile.pixelY + 12, // Middle of the tile
+          28, 8, // Width, Height - wide but short for fence
+          0x00ff00, 0.3 // Green color for debugging
         );
-        this.physics.add.existing(obstacle, true); // true = static body
+        this.physics.add.existing(obstacle, true);
         obstacleGroup.add(obstacle);
         obstacleCount++;
-        console.log(`Added fence obstacle at ${tile.x},${tile.y} - tile index: ${tile.index}`);
       }
     });
   }
@@ -207,13 +367,26 @@ function create() {
   // backgroundLayer.setScale(1);
 
   // Add player as a physics sprite BEFORE setting up camera
+  // Initialize keyboard input
+  this.input.keyboard.enableGlobalCapture();
+  const keyD = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
+  this.input.keyboard.on('keydown-D', () => {
+    CONFIG.debug = !CONFIG.debug;
+    console.log('Debug mode:', CONFIG.debug ? 'ON' : 'OFF');
+    console.log('Current noCollisionTrees:', Array.from(CONFIG.noCollisionTrees));
+  });
+  
+  // Initialize player
   player = this.physics.add.sprite(400, 300, "idle").setScale(2);
   player.setCollideWorldBounds(true);
   player.play("idle");
   
-  // Make sure player has a proper physics body
-  player.body.setSize(32, 32); // Set collision box size
-  player.body.setOffset(32, 32); // Adjust offset due to scaling
+  // Initialize cursor keys for movement
+  cursors = this.input.keyboard.createCursorKeys();
+  
+  // Configure player's physics body
+  player.body.setSize(20, 28, true); // Slightly smaller than character
+  player.body.setOffset(38, 36); // Better centered collision box
   
   console.log("Player physics body:", player.body);
   console.log("Player body size:", player.body.width, "x", player.body.height);
@@ -247,9 +420,60 @@ function create() {
     repeat: 0
   });
 
-  // Set up collision between player and tilemap (if you have collision tiles)
-  // this.physics.add.collider(player, backgroundLayer);
-
+  // Set up basic collision between player and obstacles
+  if (obstacleGroup) {
+    // Configure physics world
+    this.physics.world.gravity.y = 0;
+    
+    // Configure player physics
+    player.body.setBounce(0);
+    player.body.setCollideWorldBounds(true);
+    
+    // Configure obstacle physics
+    obstacleGroup.getChildren().forEach(obstacle => {
+      obstacle.body.setImmovable(true);
+      obstacle.body.allowGravity = false;
+    });
+    
+    // Add simple collider
+    this.physics.add.collider(player, obstacleGroup, () => {
+      // This empty callback ensures the collision is processed
+    });
+    
+    // Add a post-update step to handle any potential overlaps
+    this.physics.world.on('worldstep', () => {
+      const playerBody = player.body;
+      
+      // Check for overlaps with all obstacles
+      obstacleGroup.getChildren().forEach(obstacle => {
+        if (this.physics.world.overlap(playerBody, obstacle.body)) {
+          // Simple push out from the obstacle
+          if (playerBody.x < obstacle.body.x) {
+            player.x = obstacle.body.left - playerBody.width / 2 - 1;
+          } else {
+            player.x = obstacle.body.right + playerBody.width / 2 + 1;
+          }
+          
+          if (playerBody.y < obstacle.body.y) {
+            player.y = obstacle.body.top - playerBody.height / 2 - 1;
+          } else {
+            player.y = obstacle.body.bottom + playerBody.height / 2 + 1;
+          }
+          
+          // Stop any residual movement
+          playerBody.setVelocity(0);
+        }
+      });
+    });
+    
+    console.log("Added simple collision with obstacle group");
+  }
+  
+  // Optional: You can also add collision with Logs if they should be obstacles
+  // if (layers["Logs"]) {
+  //   this.physics.add.collider(player, layers["Logs"]);
+  // }
+  
   // Now that the map is properly sized, use the full map dimensions
   // Set world bounds to match the entire map
   this.physics.world.setBounds(0, 0, map.widthInPixels, map.heightInPixels);
@@ -269,43 +493,16 @@ function create() {
   this.cameras.main.setZoom(zoom);
   this.cameras.main.centerOn(map.widthInPixels / 2, map.heightInPixels / 2);
   
-  // Position player in the center of the map
-  player.setPosition(map.widthInPixels / 2, map.heightInPixels / 2);
+  // Position player in a grassy area (top-left corner of the map)
+  // Using fixed coordinates that should be in a grassy area
+  const spawnX = 550;  // Fixed X position in grassy area
+  const spawnY = 700;  // Fixed Y position in grassy area
+  player.setPosition(spawnX, spawnY);
+  console.log(`Player spawned at: ${spawnX}, ${spawnY} (grassy area)`);
   
   // Player collision with world bounds
   player.setCollideWorldBounds(true);
   
-  // Add collision between player and obstacle layers
-  if (layers["Trees"]) {
-    this.physics.add.collider(player, layers["Trees"]);
-    console.log("Added collision with Trees layer");
-    
-    // Debug collision
-    layers["Trees"].forEachTile(tile => {
-      if (tile.index !== -1) {
-        console.log(`Tree tile at ${tile.x},${tile.y} - index: ${tile.index}, collides: ${tile.collides}`);
-        return false; // Stop after first tile to avoid spam
-      }
-    });
-  }
-  
-  if (layers["Fences"]) {
-    this.physics.add.collider(player, layers["Fences"]);
-    console.log("Added collision with Fences layer");
-    
-    // Debug collision
-    layers["Fences"].forEachTile(tile => {
-      if (tile.index !== -1) {
-        console.log(`Fence tile at ${tile.x},${tile.y} - index: ${tile.index}, collides: ${tile.collides}`);
-        return false; // Stop after first tile to avoid spam
-      }
-    });
-  }
-  
-  // Optional: You can also add collision with Logs if they should be obstacles
-  // if (layers["Logs"]) {
-  //   this.physics.add.collider(player, layers["Logs"]);
-  // }
   
   // Add camera follow after a delay
   this.time.delayedCall(2000, () => {
@@ -331,6 +528,13 @@ function create() {
 }
 
 function update() {
+  // Toggle debug mode with 'D' key
+  if (cursors.D && Phaser.Input.Keyboard.JustDown(cursors.D)) {
+    CONFIG.debug = !CONFIG.debug;
+    console.log('Debug mode:', CONFIG.debug ? 'ON' : 'OFF');
+    console.log('Current noCollisionTrees:', Array.from(CONFIG.noCollisionTrees));
+  }
+
   // Don't process movement if attacking or hurting
   if (isAttacking || isHurting) {
     player.setVelocity(0);
